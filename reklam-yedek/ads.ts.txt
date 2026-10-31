@@ -1,0 +1,89 @@
+import { Platform } from 'react-native';
+import { CONFIG } from '@/config';
+
+/**
+ * AdMob başlatma. Reşit olmayanlar için sıkı ayar: herkese G derecesi + reşit olmayan etiketi.
+ * Modül web'de yoktur; bu yüzden require ile yalnızca Android'de yüklenir.
+ */
+let started: Promise<boolean> | null = null;
+
+export function adsAvailable(): boolean {
+  return Platform.OS === 'android' && CONFIG.ads.enabled;
+}
+
+function interstitialUnitId(): string | null {
+  if (!adsAvailable()) return null;
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { TestIds } = require('react-native-google-mobile-ads');
+  if (CONFIG.ads.useTestAds) return TestIds.INTERSTITIAL;
+  return CONFIG.ads.androidInterstitialUnitId || null;
+}
+
+export function startAds(): Promise<boolean> {
+  if (!adsAvailable()) return Promise.resolve(false);
+  if (started) return started;
+  started = (async () => {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const ads = require('react-native-google-mobile-ads');
+      const mobileAds = ads.default;
+      const { AdsConsent, MaxAdContentRating } = ads;
+      let canRequest = true;
+      try {
+        // AEA/İngiltere'de Google onay ekranını gerekirse gösterir; diğer ülkelerde sessiz geçer.
+        const info = await AdsConsent.gatherConsent();
+        canRequest = info?.canRequestAds !== false;
+      } catch {
+        // Onay formu AdMob'da tanımlı değilse hata verebilir; kişiselleştirilmemiş reklamla devam edilir.
+      }
+      if (!canRequest) return false;
+      await mobileAds().setRequestConfiguration({
+        maxAdContentRating: MaxAdContentRating.G,
+        tagForUnderAgeOfConsent: true,
+      });
+      await mobileAds().initialize();
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+  return started;
+}
+
+let ad: any = null;
+let adLoaded = false;
+let lastShown = 0;
+let skipped = false;
+
+function preload() {
+  const unit = interstitialUnitId();
+  if (!unit) return;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { InterstitialAd, AdEventType } = require('react-native-google-mobile-ads');
+    ad = InterstitialAd.createForAdRequest(unit, { requestNonPersonalizedAdsOnly: true });
+    adLoaded = false;
+    ad.addAdEventListener(AdEventType.LOADED, () => { adLoaded = true; });
+    ad.addAdEventListener(AdEventType.CLOSED, () => { lastShown = Date.now(); preload(); });
+    ad.addAdEventListener(AdEventType.ERROR, () => { adLoaded = false; });
+    ad.load();
+  } catch {
+    ad = null;
+  }
+}
+
+/** Reklamı hazırda tutar. startAds başarılı olunca çağrılır. */
+export async function prepareAds() {
+  if (await startAds()) preload();
+}
+
+/**
+ * Doğal bir bitiş anında (ders özeti kaydı, deneme ekleme) çağır. Hazır değilse ya da sık ise hiçbir şey yapmaz;
+ * kullanıcıyı asla bekletmez. Odak, alarm ve ders başlatma anlarında ÇAĞIRMA.
+ */
+export function showInterstitialIfDue() {
+  if (!adsAvailable() || !ad || !adLoaded) return;
+  if (CONFIG.ads.skipFirst && !skipped) { skipped = true; return; }
+  if (Date.now() - lastShown < CONFIG.ads.minGapMinutes * 60_000) return;
+  try { ad.show(); lastShown = Date.now(); adLoaded = false; } catch { /* yoksay */ }
+}
